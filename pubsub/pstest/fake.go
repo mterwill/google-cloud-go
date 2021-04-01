@@ -23,9 +23,13 @@
 package pstest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"sort"
 	"strings"
@@ -97,6 +101,7 @@ type GServer struct {
 	nextID         int
 	streamTimeout  time.Duration
 	timeNowFunc    func() time.Time
+	onPushError    func(error)
 	reactorOptions ReactorOptions
 }
 
@@ -131,6 +136,11 @@ func NewServer(opts ...ServerReactorOption) *Server {
 // be used instead of time.Now for this server.
 func (s *Server) SetTimeNowFunc(f func() time.Time) {
 	s.GServer.timeNowFunc = f
+}
+
+// OnPushError ...
+func (s *Server) OnPushError(f func(error)) {
+	s.GServer.onPushError = f
 }
 
 // Publish behaves as if the Publish RPC was called with a message with the given
@@ -414,7 +424,7 @@ func (s *GServer) CreateSubscription(_ context.Context, ps *pb.Subscription) (*p
 		ps.PushConfig = &pb.PushConfig{}
 	}
 
-	sub := newSubscription(top, &s.mu, s.timeNowFunc, ps)
+	sub := newSubscription(top, &s.mu, s.timeNowFunc, s.onPushError, ps)
 	top.subs[ps.Name] = sub
 	s.subs[ps.Name] = sub
 	sub.start(&s.wg)
@@ -682,9 +692,10 @@ type subscription struct {
 	streams     []*stream
 	done        chan struct{}
 	timeNowFunc func() time.Time
+	onPushError func(error)
 }
 
-func newSubscription(t *topic, mu *sync.Mutex, timeNowFunc func() time.Time, ps *pb.Subscription) *subscription {
+func newSubscription(t *topic, mu *sync.Mutex, timeNowFunc func() time.Time, onPushError func(error), ps *pb.Subscription) *subscription {
 	at := time.Duration(ps.AckDeadlineSeconds) * time.Second
 	if at == 0 {
 		at = 10 * time.Second
@@ -697,6 +708,7 @@ func newSubscription(t *topic, mu *sync.Mutex, timeNowFunc func() time.Time, ps 
 		msgs:        map[string]*message{},
 		done:        make(chan struct{}),
 		timeNowFunc: timeNowFunc,
+		onPushError: onPushError,
 	}
 }
 
@@ -713,6 +725,11 @@ func (s *subscription) start(wg *sync.WaitGroup) {
 			}
 		}
 	}()
+
+	if s.proto.PushConfig.PushEndpoint != "" {
+		stream := s.newStream()
+		go stream.pushLoop(s.proto.PushConfig.PushEndpoint)
+	}
 }
 
 func (s *subscription) stop() {
@@ -816,8 +833,10 @@ func (s *GServer) StreamingPull(sps pb.Subscriber_StreamingPullServer) error {
 		return err
 	}
 	// Create a new stream to handle the pull.
-	st := sub.newStream(sps, s.streamTimeout)
-	err = st.pull(&s.wg)
+	s.mu.Lock()
+	st := sub.newStream()
+	s.mu.Unlock()
+	err = st.pull(&s.wg, sps, s.streamTimeout)
 	sub.deleteStream(st)
 	return err
 }
@@ -986,18 +1005,15 @@ func (s *subscription) maintainMessages(now time.Time) {
 	}
 }
 
-func (s *subscription) newStream(gs pb.Subscriber_StreamingPullServer, timeout time.Duration) *stream {
+// Must be called with the lock held.
+func (s *subscription) newStream() *stream {
 	st := &stream{
 		sub:        s,
 		done:       make(chan struct{}),
 		msgc:       make(chan *pb.ReceivedMessage),
-		gstream:    gs,
 		ackTimeout: s.ackTimeout,
-		timeout:    timeout,
 	}
-	s.mu.Lock()
 	s.streams = append(s.streams, st)
-	s.mu.Unlock()
 	return st
 }
 
@@ -1041,26 +1057,24 @@ type stream struct {
 	sub        *subscription
 	done       chan struct{} // closed when the stream is finished
 	msgc       chan *pb.ReceivedMessage
-	gstream    pb.Subscriber_StreamingPullServer
 	ackTimeout time.Duration
-	timeout    time.Duration
 }
 
 // pull manages the StreamingPull interaction for the life of the stream.
-func (st *stream) pull(wg *sync.WaitGroup) error {
+func (st *stream) pull(wg *sync.WaitGroup, gstream pb.Subscriber_StreamingPullServer, timeout time.Duration) error {
 	errc := make(chan error, 2)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		errc <- st.sendLoop()
+		errc <- st.sendLoop(gstream)
 	}()
 	go func() {
 		defer wg.Done()
-		errc <- st.recvLoop()
+		errc <- st.recvLoop(gstream)
 	}()
 	var tchan <-chan time.Time
-	if st.timeout > 0 {
-		tchan = time.After(st.timeout)
+	if timeout > 0 {
+		tchan = time.After(timeout)
 	}
 	// Wait until one of the goroutines returns an error, or we time out.
 	var err error
@@ -1075,23 +1089,73 @@ func (st *stream) pull(wg *sync.WaitGroup) error {
 	return err
 }
 
-func (st *stream) sendLoop() error {
+// pushLoop ...
+func (st *stream) pushLoop(endpoint string) {
+	for {
+		select {
+		case <-st.sub.done:
+			return
+		case rm := <-st.msgc:
+			if err := st.pushOne(endpoint, rm); err != nil && st.sub.onPushError != nil {
+				st.sub.onPushError(err)
+			}
+		}
+	}
+}
+
+// consider a message acknowledged if one of these statuses is returned
+// see https://cloud.google.com/pubsub/docs/push#receiving_messages
+var ackStatusCodes = map[int]struct{}{
+	102: {}, 200: {}, 201: {}, 202: {}, 204: {},
+}
+
+func (st *stream) pushOne(endpoint string, rm *pb.ReceivedMessage) error {
+	// TODO: real message format
+	msg, err := json.Marshal(rm.Message)
+	if err != nil {
+		st.sub.onPushError(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), st.ackTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(msg))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if _, ok := ackStatusCodes[res.StatusCode]; !ok {
+		return errors.New("push subscription returned " + res.Status)
+	}
+
+	st.sub.mu.Lock()
+	st.sub.ack(rm.AckId)
+	st.sub.mu.Unlock()
+
+	return nil
+}
+
+func (st *stream) sendLoop(gstream pb.Subscriber_StreamingPullServer) error {
 	for {
 		select {
 		case <-st.done:
 			return nil
 		case rm := <-st.msgc:
 			res := &pb.StreamingPullResponse{ReceivedMessages: []*pb.ReceivedMessage{rm}}
-			if err := st.gstream.Send(res); err != nil {
+			if err := gstream.Send(res); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (st *stream) recvLoop() error {
+func (st *stream) recvLoop(gstream pb.Subscriber_StreamingPullServer) error {
 	for {
-		req, err := st.gstream.Recv()
+		req, err := gstream.Recv()
 		if err != nil {
 			return err
 		}

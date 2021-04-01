@@ -15,9 +15,13 @@
 package pstest
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -263,6 +267,56 @@ func TestClearMessages(t *testing.T) {
 	msgs = s.Messages()
 	if got, want := len(msgs), 0; got != want {
 		t.Errorf("got %d messages, want %d", got, want)
+	}
+}
+
+func TestPushSubscription(t *testing.T) {
+	pclient, sclient, s, cleanup := newFake(context.Background(), t)
+	defer cleanup()
+
+	var reqs []*http.Request
+	httpSvr := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r2 := r.Clone(r.Context())
+		r2.Body = ioutil.NopCloser(bytes.NewReader(body))
+		reqs = append(reqs, r2)
+	}))
+	defer httpSvr.Close()
+
+	topic := mustCreateTopic(context.Background(), t, pclient, &pb.Topic{Name: "projects/p/topics/t"})
+	mustCreateSubscription(context.Background(), t, sclient, &pb.Subscription{
+		Name:  "push",
+		Topic: topic.Name,
+		PushConfig: &pb.PushConfig{
+			PushEndpoint: httpSvr.URL,
+		},
+		AckDeadlineSeconds: 10,
+	})
+
+	s.OnPushError(func(err error) {
+		t.Fatal(err)
+	})
+
+	for i := 0; i < 3; i++ {
+		s.Publish(topic.Name, []byte("hello"), nil)
+	}
+
+	for {
+		acks := 0
+		for _, msg := range s.Messages() {
+			acks += msg.Acks
+		}
+		if acks == 3 {
+			break
+		}
+	}
+
+	if len(reqs) != 3 {
+		t.Error("expecting 3 requests")
 	}
 }
 
@@ -658,7 +712,7 @@ func TestTryDeliverMessage(t *testing.T) {
 		{availStreamIdx: 3, expectedOutIdx: 2}, // s0, s1 (deleted), s2, s3 becomes s0, s2, s3. So we expect outIdx=2.
 	} {
 		top := newTopic(&pb.Topic{Name: "some-topic"})
-		sub := newSubscription(top, &sync.Mutex{}, time.Now, &pb.Subscription{Name: "some-sub", Topic: "some-topic"})
+		sub := newSubscription(top, &sync.Mutex{}, time.Now, nil, &pb.Subscription{Name: "some-sub", Topic: "some-topic"})
 
 		done := make(chan struct{}, 1)
 		done <- struct{}{}
